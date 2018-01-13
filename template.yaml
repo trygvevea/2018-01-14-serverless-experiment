@@ -1,0 +1,348 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: My static website
+Parameters:
+  Hostname:
+    Type: 'String'
+    Description: 'Enter the hostname for which the content will be served'
+  RedirectHostname:
+    Type: 'String'
+    Description: 'Enter a hostname which will redirect all requests to hostname (www-prefix)'
+  RepoName:
+    Type: 'String'
+    Description: 'Enter the name of the code repository'
+  RepoDescription:
+    Type: 'String'
+    Description: 'Enter a description for the code repository'
+  CertificateArn:
+    Type: 'String'
+    Description: 'Enter the ARN for the Certificate to be used in Cloudfront'
+  HostedZoneId:
+    Type: 'String'
+    Description: 'Route 53 zone ID for DNS'
+Resources:
+  PushTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName:
+            Fn::Join:
+            - "-"
+            - - Ref: AWS::StackName
+              - "PushTriggerPolicy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              Effect: Allow
+              Action:
+                - iam:PassRole
+                - ec2:RunInstances
+              Resource:
+                - !GetAtt UpdateBucketRole.Arn
+                - "arn:aws:ec2:*:*:subnet/*"
+                - "arn:aws:ec2:*::image/ami-5e29aa31"
+                - "arn:aws:ec2:*:*:instance/*"
+                - "arn:aws:ec2:*:*:volume/*"
+                - "arn:aws:ec2:*:*:security-group/*"
+                - "arn:aws:ec2:*:*:network-interface/*"
+  UpdateBucketProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties: 
+      Roles:
+      - Ref: UpdateBucketRole
+  UpdateBucketRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - ec2.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName:
+            Fn::Join:
+            - "-"
+            - - Ref: AWS::StackName
+              - "UpdateBucketPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              Effect: Allow
+              Action:
+                - codecommit:GetRepositoryTriggers
+                - s3:*
+                - codecommit:GetTree
+                - codecommit:GitPull
+                - codecommit:BatchGetRepositories
+                - codecommit:GetObjectIdentifier
+                - codecommit:GetBlob
+                - codecommit:GetReferences
+                - codecommit:CancelUploadArchive
+                - codecommit:GetCommit
+                - codecommit:GetUploadArchiveStatus
+                - codecommit:GetCommitHistory
+                - codecommit:GetRepository
+                - codecommit:GetBranch
+              Resource:
+                - Fn::Join:
+                  - ""
+                  - - "arn:aws:s3:::"
+                    - Ref: Hostname
+                - Fn::Join:
+                  - ""
+                  - - "arn:aws:s3:::"
+                    - Ref: Hostname
+                    - "/*"
+                - Fn::Join:
+                  - ":"
+                  - - "arn:aws:codecommit"
+                    - Ref: AWS::Region
+                    - Ref: AWS::AccountId
+                    - Ref: RepoName
+  CodeUpdateGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName:
+        Fn::Join:
+        - "-"
+        - - Ref: AWS::StackName
+          - "CodeUpdateGroup"
+      Policies:
+        - PolicyName:
+            Fn::Join:
+            - "-"
+            - - Ref: AWS::StackName
+              - "CodeUpdatePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              Effect: Allow
+              Action:
+                - codecommit:*
+                - s3:*
+              Resource:
+                - Fn::Join:
+                  - ""
+                  - - "arn:aws:s3:::"
+                    - Ref: Hostname
+                - Fn::Join:
+                  - ""
+                  - - "arn:aws:s3:::"
+                    - Ref: Hostname
+                    - "/*"
+                - Fn::Join:
+                  - ":"
+                  - - "arn:aws:codecommit"
+                    - Ref: AWS::Region
+                    - Ref: AWS::AccountId
+                    - Ref: RepoName
+  Gitrepo:
+    Type: "AWS::CodeCommit::Repository"
+    Properties: 
+      RepositoryDescription: !Ref RepoDescription
+      RepositoryName: !Ref RepoName
+      Triggers:
+      - Name: "Pushtrigger"
+        DestinationArn: !GetAtt PushTrigger.Arn
+        Events:
+        - "updateReference"
+  PushTriggerPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt PushTrigger.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: codecommit.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn:
+        Fn::Join:
+        - ":"
+        - - "arn:aws:codecommit"
+          - Ref: AWS::Region
+          - Ref: AWS::AccountId
+          - Ref: RepoName
+  PushTrigger:
+    Type: "AWS::Lambda::Function"
+    Properties: 
+      Code:
+        ZipFile: >
+          import os
+          
+          import boto3
+          
+          def pushHandler(event, context):
+              client = boto3.client('ec2', region_name=os.environ.get('REGION'))
+              res = client.run_instances(ImageId='ami-5e29aa31',
+                                         InstanceType='m3.medium',
+                                         MinCount=1, MaxCount=1,
+                                         InstanceInitiatedShutdownBehavior='terminate',
+                                         IamInstanceProfile= { "Arn": os.environ.get('INSTANCEPROFILE') },
+                                         UserData="""#!/bin/bash
+              yum install aws-cli git -y
+              yum install -y curl gpg gcc gcc-c++ make
+              gpg --keyserver hkp://keys.gnupg.net --recv-keys 409B6B1796C275462A1703113804BB82D39DC0E3
+              curl -sSL https://get.rvm.io | bash -s stable
+              usermod -a -G rvm ec2-user
+              cd ~ec2-user
+              sudo -u ec2-user git config --global credential.helper '!aws codecommit credential-helper $@'
+              sudo -u ec2-user git config --global credential.UseHttpPath true
+              sudo -u ec2-user git clone https://git-codecommit."""+os.environ.get('REGION')+""".amazonaws.com/v1/repos/"""+os.environ.get('REPONAME')+"""
+              cd ~ec2-user/"""+os.environ.get('REPONAME')+"""
+              ls -la
+              sudo -u ec2-user bash sync.bash
+              aws s3 cp /var/log/cloud-init-output.log s3://"""+os.environ.get('TARGETBUCKET')+"""/output-last.txt
+              poweroff
+              """)
+              if len(res['Instances']) == 1:
+                  return {"message": "success"}
+              else:
+                  raise Exception('I failed!')
+      Description: "Push handler"
+      FunctionName:
+        Fn::Join:
+        - "-"
+        - - Ref: AWS::StackName
+          - "pushHandler"
+      Environment:
+        Variables:
+          INSTANCEPROFILE: !GetAtt UpdateBucketProfile.Arn
+          TARGETBUCKET:
+            Ref: Hostname
+          REPONAME:
+            Ref: RepoName
+          REGION:
+            Ref: AWS::Region
+      Handler: "index.pushHandler"
+      Timeout: 10
+      Runtime: "python2.7"
+      Role: !GetAtt PushTriggerRole.Arn
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName:
+        Ref: Hostname
+      AccessControl: "PublicRead"
+      WebsiteConfiguration:
+        IndexDocument: "index.html"
+        ErrorDocument: "404.html"
+  CloudFrontDistribution:
+    Type: "AWS::CloudFront::Distribution"
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - Ref: Hostname
+        DefaultCacheBehavior:
+          TargetOriginId: "basebucket"
+          ViewerProtocolPolicy: "redirect-to-https"
+          Compress: True
+          ForwardedValues:
+            QueryString: False
+            Cookies:
+              Forward: "none"
+        DefaultRootObject: "index.html"
+        Enabled: True
+        IPV6Enabled: True
+        HttpVersion: http2
+        ViewerCertificate:
+          # Disse to var teite, fordi jeg slet med case sensitivitet vs. doc.
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: "sni-only"
+        Origins:
+          - DomainName:
+              Fn::Join:
+              - "."
+              - - Ref: Hostname
+                - "s3-website"
+                - Ref: AWS::Region
+                - "amazonaws.com"
+            Id: "basebucket"
+            CustomOriginConfig:
+              OriginProtocolPolicy: "http-only"
+  Route53Record:
+    Type: 'AWS::Route53::RecordSetGroup'
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      RecordSets:
+      - Name: !Ref Hostname
+        Type: A
+        AliasTarget:
+          HostedZoneId: Z2FDTNDATAQYW2 # Magic CloudFront number
+          DNSName: !GetAtt 'CloudFrontDistribution.DomainName'
+  Route53Recordv6:
+    Type: 'AWS::Route53::RecordSetGroup'
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      RecordSets:
+      - Name: !Ref Hostname
+        Type: AAAA
+        AliasTarget:
+          HostedZoneId: Z2FDTNDATAQYW2 # Magic CloudFront number
+          DNSName: !GetAtt 'CloudFrontDistribution.DomainName'
+  S3BucketRedirect:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName:
+        Ref: RedirectHostname
+      WebsiteConfiguration:
+        RedirectAllRequestsTo:
+          HostName: !Ref Hostname
+          Protocol: https
+  CloudFrontDistributionRedirect:
+    Type: "AWS::CloudFront::Distribution"
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - Ref: RedirectHostname
+        DefaultCacheBehavior:
+          TargetOriginId: "basebucket"
+          ViewerProtocolPolicy: "redirect-to-https"
+          Compress: True
+          ForwardedValues:
+            QueryString: False
+            Cookies:
+              Forward: "none"
+        Enabled: True
+        IPV6Enabled: True
+        HttpVersion: http2
+        ViewerCertificate:
+          # Disse to var teite, fordi jeg slet med case sensitivitet vs. doc.
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: "sni-only"
+        Origins:
+          - DomainName: !Select [2, !Split ['/', !GetAtt 'S3BucketRedirect.WebsiteURL']]
+            Id: "basebucket"
+            CustomOriginConfig:
+              OriginProtocolPolicy: "http-only"
+  Route53RecordRedirect:
+    Type: 'AWS::Route53::RecordSetGroup'
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      RecordSets:
+      - Name: !Ref RedirectHostname
+        Type: A
+        AliasTarget:
+          HostedZoneId: Z2FDTNDATAQYW2 # Magic CloudFront number
+          DNSName: !GetAtt 'CloudFrontDistributionRedirect.DomainName'
+  Route53Recordv6Redirect:
+    Type: 'AWS::Route53::RecordSetGroup'
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      RecordSets:
+      - Name: !Ref RedirectHostname
+        Type: AAAA
+        AliasTarget:
+          HostedZoneId: Z2FDTNDATAQYW2 # Magic CloudFront number
+          DNSName: !GetAtt 'CloudFrontDistributionRedirect.DomainName'
